@@ -279,7 +279,7 @@ public class UserContentController implements Disposable {
     return pluginScriptsRequired;
   }
 
-  public boolean addPluginScript(PluginScript pluginScript) {
+  public boolean addPluginScript(final PluginScript pluginScript) {
     ContentWorld contentWorld = pluginScript.getContentWorld();
     if (contentWorld != null) {
       contentWorlds.add(contentWorld);
@@ -291,13 +291,31 @@ public class UserContentController implements Disposable {
         source = "if (document.readyState === 'complete') { " + source + "} else { window.addEventListener('load', function() { " + source + " }); }";
       }
       source = wrapSourceCodeAddChecks(source, pluginScript);
+      final String finalSource = wrapSourceCodeInContentWorld(pluginScript.getContentWorld(), source);
 
-      ScriptHandler scriptHandler = WebViewCompat.addDocumentStartJavaScript(
-              webView,
-              wrapSourceCodeInContentWorld(pluginScript.getContentWorld(), source),
-              pluginScript.getAllowedOriginRules()
-      );
-      this.scriptHandlerMap.put(pluginScript, scriptHandler);
+      // Defer WebViewCompat.addDocumentStartJavaScript to the next UI-thread
+      // message. Its binder IPC to the Chromium renderer process must not run
+      // while FlutterWebView is still synchronously building the platform view.
+      // InAppWebView.prepareAndAddUserScripts() issues 5 to 9 of these
+      // registrations synchronously when the JS bridge is enabled (PromisePolyfill,
+      // JS Bridge, Print, OnWindowBlur, OnWindowFocus, plus up to four more
+      // depending on settings); running them inline was observed to leave
+      // onWebViewCreated never fired on ~50% of release-build cold starts on real
+      // Android devices, with the failure toggling deterministically across kill-
+      // relaunch cycles. Debug builds were not affected.
+      webView.post(new Runnable() {
+        @Override
+        public void run() {
+          if (webView != null) {
+            ScriptHandler scriptHandler = WebViewCompat.addDocumentStartJavaScript(
+                    webView,
+                    finalSource,
+                    pluginScript.getAllowedOriginRules()
+            );
+            scriptHandlerMap.put(pluginScript, scriptHandler);
+          }
+        }
+      });
     }
     return this.pluginScripts.get(pluginScript.getInjectionTime()).add(pluginScript);
   }
