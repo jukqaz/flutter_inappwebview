@@ -164,6 +164,9 @@ final public class InAppWebView extends InputAwareWebView implements InAppWebVie
   public int newCheckContextMenuShouldBeClosedTaskTask = 100; // ms
 
   public UserContentController userContentController = new UserContentController(this);
+  // Set when a load was issued while document-start registrations were still pending (#2843):
+  // once they register, that page ran without the JS bridge, so it is reloaded exactly once.
+  private boolean reloadWhenDocumentStartScriptsRecover = false;
 
   public Map<String, ValueCallback<String>> callAsyncJavaScriptCallbacks = new HashMap<>();
   public Map<String, ValueCallback<String>> evaluateJavaScriptContentWorldCallbacks = new HashMap<>();
@@ -259,6 +262,7 @@ final public class InAppWebView extends InputAwareWebView implements InAppWebVie
 
   @SuppressLint("RestrictedApi")
   public void prepare() {
+    installDocumentStartScriptsRecoveryHook();
     if (customSettings.alpha != null) {
       setAlpha(customSettings.alpha.floatValue());
     }
@@ -713,7 +717,36 @@ final public class InAppWebView extends InputAwareWebView implements InAppWebVie
     }
   }
 
+  private void noteLoadWhileDocumentStartScriptsPending() {
+    if (userContentController != null && userContentController.hasPendingDocumentStartScripts()) {
+      reloadWhenDocumentStartScriptsRecover = true;
+    }
+  }
+
+  private void installDocumentStartScriptsRecoveryHook() {
+    if (userContentController == null) {
+      return;
+    }
+    userContentController.setOnDocumentStartScriptsRecovered(new Runnable() {
+      @Override
+      public void run() {
+        if (reloadWhenDocumentStartScriptsRecover) {
+          reloadWhenDocumentStartScriptsRecover = false;
+          Log.w(LOG_TAG, "document-start scripts registered after a page load had started; reloading once so the JS bridge is present");
+          reload();
+        }
+      }
+    });
+  }
+
+  @Override
+  public void loadDataWithBaseURL(String baseUrl, String data, String mimeType, String encoding, String historyUrl) {
+    noteLoadWhileDocumentStartScriptsPending();
+    super.loadDataWithBaseURL(baseUrl, data, mimeType, encoding, historyUrl);
+  }
+
   public void loadUrl(URLRequest urlRequest) {
+    noteLoadWhileDocumentStartScriptsPending();
     String url = urlRequest.getUrl();
     String method = urlRequest.getMethod();
     if (method != null && method.equals("POST")) {
@@ -730,6 +763,7 @@ final public class InAppWebView extends InputAwareWebView implements InAppWebVie
   }
 
   public void loadFile(String assetFilePath) throws IOException {
+    noteLoadWhileDocumentStartScriptsPending();
     if (plugin == null) {
       return;
     }
@@ -2084,6 +2118,7 @@ final public class InAppWebView extends InputAwareWebView implements InAppWebVie
 
   public void setUserContentController(UserContentController userContentController) {
     this.userContentController = userContentController;
+    installDocumentStartScriptsRecoveryHook();
   }
 
   public Map<String, WebMessageChannel> getWebMessageChannels() {

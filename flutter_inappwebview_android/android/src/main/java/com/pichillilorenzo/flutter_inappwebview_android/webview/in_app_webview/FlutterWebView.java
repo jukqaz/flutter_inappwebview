@@ -131,7 +131,10 @@ public class FlutterWebView implements PlatformWebView {
       // synchronously here, races ahead of the deferred bridge registrations,
       // and pages cached or served fast enough can execute @document-start
       // scripts before window.flutter_inappwebview is defined.
-      webView.post(new Runnable() {
+      // If Chromium rejected the document-start registrations because it was still starting
+      // (#2843), hold the first load until they are retried successfully (or given up on after a
+      // bounded wait) so the page never runs without the JS bridge.
+      final Runnable initialLoad = new Runnable() {
         @Override
         public void run() {
           if (webView == null) {
@@ -158,6 +161,15 @@ public class FlutterWebView implements PlatformWebView {
               webView.loadUrl(urlRequest);
             }
           }
+        }
+      };
+      webView.post(new Runnable() {
+        @Override
+        public void run() {
+          if (webView == null) {
+            return;
+          }
+          webView.userContentController.runWhenDocumentStartScriptsReady(initialLoad);
         }
       });
     }

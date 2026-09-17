@@ -1,6 +1,7 @@
 package com.pichillilorenzo.flutter_inappwebview_android.types;
 
 import android.annotation.SuppressLint;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.Log;
 import android.webkit.WebView;
@@ -36,6 +37,32 @@ public class UserContentController implements Disposable {
   }};
 
   private final Map<UserScript, ScriptHandler> scriptHandlerMap = new HashMap<>();
+
+  // Document-start registrations that Chromium rejected because its browser process had not
+  // finished starting (#2843: "Must be started before we block!" on the first WebView of a cold
+  // process). Instead of dropping them, which leaves the page without the JS bridge and without
+  // the app's own AT_DOCUMENT_START scripts, retry them with backoff and let callers gate their
+  // first load on the outcome (see runWhenDocumentStartScriptsReady).
+  private static final long RETRY_INITIAL_DELAY_MS = 16;
+  private static final long RETRY_MAX_DELAY_MS = 500;
+  private static final long RETRY_GIVE_UP_AFTER_MS = 5000;
+  private final List<PendingDocumentStartScript> pendingDocumentStartScripts = new ArrayList<>();
+  private final List<Runnable> documentStartScriptsReadyCallbacks = new ArrayList<>();
+  @Nullable
+  private Runnable onDocumentStartScriptsRecovered;
+  private boolean retryScheduled = false;
+  private long retryDelayMs = RETRY_INITIAL_DELAY_MS;
+  private long firstFailureUptimeMs = 0;
+
+  private static class PendingDocumentStartScript {
+    final UserScript script;
+    final String source;
+
+    PendingDocumentStartScript(UserScript script, String source) {
+      this.script = script;
+      this.source = source;
+    }
+  }
 
   @Nullable
   private ScriptHandler contentWorldsCreatorScript;
@@ -211,22 +238,11 @@ public class UserContentController implements Disposable {
       }
       source = wrapSourceCodeAddChecks(source, userOnlyScript);
 
-      try {
-        ScriptHandler scriptHandler = WebViewCompat.addDocumentStartJavaScript(
-                webView,
-                wrapSourceCodeInContentWorld(userOnlyScript.getContentWorld(), source),
-                userOnlyScript.getAllowedOriginRules()
-        );
-        this.scriptHandlerMap.put(userOnlyScript, scriptHandler);
-      } catch (RuntimeException e) {
-        // Chromium throws "Must be started before we block!" when this runs before the browser
-        // process finished starting (first webview of a cold process). Letting it propagate aborts
-        // the whole platform-view create, which is what leaves the webview blank and
-        // onWebViewCreated unfired (#2843): skip instead. The script is not stored in
-        // scriptHandlerMap, so a later re-add retries the native registration.
-        Log.e(LOG_TAG, "addDocumentStartJavaScript failed for " + userOnlyScript.getGroupName()
-                + " (browser process not started yet?): " + e);
-      }
+      // Chromium throws "Must be started before we block!" when this runs before the browser
+      // process finished starting (first webview of a cold process). Letting it propagate aborts
+      // the whole platform-view create, which is what leaves the webview blank and
+      // onWebViewCreated unfired (#2843). The registration is queued and retried instead.
+      registerDocumentStartScriptOrRetry(userOnlyScript, wrapSourceCodeInContentWorld(userOnlyScript.getContentWorld(), source));
     }
     return this.userOnlyScripts.get(userOnlyScript.getInjectionTime()).add(userOnlyScript);
   }
@@ -318,20 +334,10 @@ public class UserContentController implements Disposable {
         @Override
         public void run() {
           if (webView != null) {
-            try {
-              ScriptHandler scriptHandler = WebViewCompat.addDocumentStartJavaScript(
-                      webView,
-                      finalSource,
-                      pluginScript.getAllowedOriginRules()
-              );
-              scriptHandlerMap.put(pluginScript, scriptHandler);
-            } catch (RuntimeException e) {
-              // "Must be started before we block!" before browser startup completes. An uncaught
-              // throw here would kill the main thread (we are inside a posted runnable): log and
-              // skip instead; a later re-add retries the registration.
-              Log.e(LOG_TAG, "addDocumentStartJavaScript failed for plugin script "
-                      + pluginScript.getGroupName() + ": " + e);
-            }
+            // "Must be started before we block!" before browser startup completes. An uncaught
+            // throw here would kill the main thread (we are inside a posted runnable); the helper
+            // queues the registration for a retry instead.
+            registerDocumentStartScriptOrRetry(pluginScript, finalSource);
           }
         }
       });
@@ -563,6 +569,125 @@ public class UserContentController implements Disposable {
           "  " + PluginScriptsUtil.VAR_PLACEHOLDER_VALUE +
           "}";
 
+  /**
+   * Registers a document-start script with Chromium. If the browser process has not finished
+   * starting yet the call throws; the script is then queued and retried with backoff until it
+   * registers or {@link #RETRY_GIVE_UP_AFTER_MS} elapses.
+   *
+   * @return true when the registration succeeded synchronously.
+   */
+  private boolean registerDocumentStartScriptOrRetry(@NonNull UserScript script, @NonNull String source) {
+    if (webView == null) {
+      return false;
+    }
+    try {
+      ScriptHandler scriptHandler = WebViewCompat.addDocumentStartJavaScript(webView, source, script.getAllowedOriginRules());
+      scriptHandlerMap.put(script, scriptHandler);
+      return true;
+    } catch (RuntimeException e) {
+      Log.w(LOG_TAG, "addDocumentStartJavaScript failed for " + script.getGroupName()
+              + " (browser process not started yet?), queued for retry: " + e);
+      pendingDocumentStartScripts.add(new PendingDocumentStartScript(script, source));
+      scheduleDocumentStartScriptRetry();
+      return false;
+    }
+  }
+
+  private void scheduleDocumentStartScriptRetry() {
+    if (retryScheduled || webView == null) {
+      return;
+    }
+    if (firstFailureUptimeMs == 0) {
+      firstFailureUptimeMs = SystemClock.uptimeMillis();
+    }
+    retryScheduled = true;
+    webView.postDelayed(new Runnable() {
+      @Override
+      public void run() {
+        retryScheduled = false;
+        retryPendingDocumentStartScripts();
+      }
+    }, retryDelayMs);
+  }
+
+  private void retryPendingDocumentStartScripts() {
+    if (webView == null) {
+      pendingDocumentStartScripts.clear();
+      finishDocumentStartScriptRetries(false);
+      return;
+    }
+    List<PendingDocumentStartScript> attempts = new ArrayList<>(pendingDocumentStartScripts);
+    pendingDocumentStartScripts.clear();
+    boolean anySuccess = false;
+    for (PendingDocumentStartScript pending : attempts) {
+      UserScript script = pending.script;
+      boolean stillWanted = !scriptHandlerMap.containsKey(script) &&
+              (userOnlyScripts.get(script.getInjectionTime()).contains(script) ||
+               pluginScripts.get(script.getInjectionTime()).contains(script));
+      if (!stillWanted) {
+        continue;
+      }
+      try {
+        ScriptHandler scriptHandler = WebViewCompat.addDocumentStartJavaScript(webView, pending.source, script.getAllowedOriginRules());
+        scriptHandlerMap.put(script, scriptHandler);
+        anySuccess = true;
+      } catch (RuntimeException e) {
+        pendingDocumentStartScripts.add(pending);
+      }
+    }
+    if (pendingDocumentStartScripts.isEmpty()) {
+      Log.i(LOG_TAG, "document-start scripts registered after retry (" + attempts.size() + " queued)");
+      finishDocumentStartScriptRetries(anySuccess);
+      return;
+    }
+    long elapsed = SystemClock.uptimeMillis() - firstFailureUptimeMs;
+    if (elapsed >= RETRY_GIVE_UP_AFTER_MS) {
+      Log.e(LOG_TAG, "giving up on " + pendingDocumentStartScripts.size()
+              + " document-start script(s) after " + elapsed + " ms; the page will load without them");
+      pendingDocumentStartScripts.clear();
+      finishDocumentStartScriptRetries(anySuccess);
+      return;
+    }
+    retryDelayMs = Math.min(retryDelayMs * 2, RETRY_MAX_DELAY_MS);
+    scheduleDocumentStartScriptRetry();
+  }
+
+  private void finishDocumentStartScriptRetries(boolean recovered) {
+    retryDelayMs = RETRY_INITIAL_DELAY_MS;
+    firstFailureUptimeMs = 0;
+    List<Runnable> callbacks = new ArrayList<>(documentStartScriptsReadyCallbacks);
+    documentStartScriptsReadyCallbacks.clear();
+    for (Runnable callback : callbacks) {
+      callback.run();
+    }
+    if (recovered && onDocumentStartScriptsRecovered != null) {
+      onDocumentStartScriptsRecovered.run();
+    }
+  }
+
+  /** True while at least one document-start registration is waiting for Chromium to start. */
+  public boolean hasPendingDocumentStartScripts() {
+    return !pendingDocumentStartScripts.isEmpty();
+  }
+
+  /**
+   * Runs {@code runnable} now if no document-start registration is pending, otherwise once the
+   * pending ones have registered or been given up on. Used to hold the first page load until the
+   * JS bridge and the user's AT_DOCUMENT_START scripts are actually in place.
+   */
+  public void runWhenDocumentStartScriptsReady(@NonNull Runnable runnable) {
+    if (!hasPendingDocumentStartScripts()) {
+      runnable.run();
+      return;
+    }
+    documentStartScriptsReadyCallbacks.add(runnable);
+  }
+
+  /** Invoked when queued registrations eventually succeed; lets the owner reload a page that already started. */
+  public void setOnDocumentStartScriptsRecovered(@Nullable Runnable runnable) {
+    onDocumentStartScriptsRecovered = runnable;
+  }
+
   @Override
   public void dispose() {
     if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT) && contentWorldsCreatorScript != null) {
@@ -570,6 +695,9 @@ public class UserContentController implements Disposable {
     }
     removeAllUserOnlyScripts();
     removeAllPluginScripts();
+    pendingDocumentStartScripts.clear();
+    documentStartScriptsReadyCallbacks.clear();
+    onDocumentStartScriptsRecovered = null;
     webView = null;
   }
 }
