@@ -793,10 +793,7 @@ public class InAppWebViewClient extends WebViewClient {
   public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
     final InAppWebView webView = (InAppWebView) view;
 
-    if (webView.customSettings.useOnRenderProcessGone && webView.channelDelegate != null) {
-      boolean didCrash = detail.didCrash();
-      int rendererPriorityAtExit = detail.rendererPriorityAtExit();
-      webView.channelDelegate.onRenderProcessGone(didCrash, rendererPriorityAtExit);
+    if (webView.handleRenderProcessGone(detail)) {
       return true;
     }
 

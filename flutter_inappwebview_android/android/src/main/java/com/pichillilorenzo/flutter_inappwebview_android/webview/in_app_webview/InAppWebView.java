@@ -118,6 +118,9 @@ import io.flutter.plugin.common.MethodChannel;
 
 final public class InAppWebView extends InputAwareWebView implements InAppWebViewInterface {
   private static final String LOG_TAG = "InAppWebView";
+  private boolean rendererGone = false;
+  private boolean disposeStarted = false;
+  private boolean destroyed = false;
   public static final String METHOD_CHANNEL_NAME_PREFIX = "com.pichillilorenzo/flutter_inappwebview_";
 
   @Nullable
@@ -2188,23 +2191,53 @@ final public class InAppWebView extends InputAwareWebView implements InAppWebVie
   }
 
 
+  // A terminated renderer cannot load even about:blank. The disposal client must
+  // also acknowledge termination after the Dart channel has already been closed.
+  @androidx.annotation.RequiresApi(api = Build.VERSION_CODES.O)
+  public boolean handleRenderProcessGone(android.webkit.RenderProcessGoneDetail detail) {
+    if (rendererGone || destroyed) return true;
+    if (!disposeStarted && !customSettings.useOnRenderProcessGone) return false;
+    rendererGone = true;
+    isLoading = false;
+    if (!disposeStarted && channelDelegate != null) {
+      channelDelegate.onRenderProcessGone(detail.didCrash(), detail.rendererPriorityAtExit());
+    }
+    if (disposeStarted) {
+      destroy();
+    } else {
+      dispose();
+    }
+    return true;
+  }
+
   @Override
   public void dispose() {
+    if (disposeStarted || destroyed) return;
+    disposeStarted = true;
     if (channelDelegate != null) {
       channelDelegate.dispose();
       channelDelegate = null;
     }
     super.dispose();
-    WebSettings settings = getSettings();
-    settings.setJavaScriptEnabled(false);
-    removeJavascriptInterface(JavaScriptBridgeJS.get_JAVASCRIPT_BRIDGE_NAME());
+    if (!rendererGone) {
+      WebSettings settings = getSettings();
+      settings.setJavaScriptEnabled(false);
+      removeJavascriptInterface(JavaScriptBridgeJS.get_JAVASCRIPT_BRIDGE_NAME());
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && WebViewFeature.isFeatureSupported(WebViewFeature.WEB_VIEW_RENDERER_CLIENT_BASIC_USAGE)) {
       WebViewCompat.setWebViewRenderProcessClient(this, null);
     }
     setWebChromeClient(new WebChromeClient());
     setWebViewClient(new WebViewClient() {
+      @Override
       public void onPageFinished(WebView view, String url) {
         destroy();
+      }
+
+      @androidx.annotation.RequiresApi(api = Build.VERSION_CODES.O)
+      @Override
+      public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+        return handleRenderProcessGone(detail);
       }
     });
     interceptOnlyAsyncAjaxRequestsPluginScript = null;
@@ -2253,11 +2286,20 @@ final public class InAppWebView extends InputAwareWebView implements InAppWebVie
       javaScriptBridgeInterface = null;
     }
     plugin = null;
-    loadUrl("about:blank");
+    if (rendererGone) {
+      destroy();
+    } else {
+      loadUrl("about:blank");
+    }
   }
 
   @Override
   public void destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    if (getParent() instanceof ViewGroup) {
+      ((ViewGroup) getParent()).removeView(this);
+    }
     super.destroy();
   }
 }
