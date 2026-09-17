@@ -53,6 +53,9 @@ public class UserContentController implements Disposable {
   private boolean retryScheduled = false;
   private long retryDelayMs = RETRY_INITIAL_DELAY_MS;
   private long firstFailureUptimeMs = 0;
+  // True once any queued registration succeeded in this retry episode, so a give-up after a partial
+  // recovery still tells the owner that scripts landed after a load may have started.
+  private boolean recoveredAnyThisEpisode = false;
 
   private static class PendingDocumentStartScript {
     final UserScript script;
@@ -635,9 +638,12 @@ public class UserContentController implements Disposable {
         pendingDocumentStartScripts.add(pending);
       }
     }
+    if (anySuccess) {
+      recoveredAnyThisEpisode = true;
+    }
     if (pendingDocumentStartScripts.isEmpty()) {
       Log.i(LOG_TAG, "document-start scripts registered after retry (" + attempts.size() + " queued)");
-      finishDocumentStartScriptRetries(anySuccess);
+      finishDocumentStartScriptRetries(recoveredAnyThisEpisode);
       return;
     }
     long elapsed = SystemClock.uptimeMillis() - firstFailureUptimeMs;
@@ -645,7 +651,7 @@ public class UserContentController implements Disposable {
       Log.e(LOG_TAG, "giving up on " + pendingDocumentStartScripts.size()
               + " document-start script(s) after " + elapsed + " ms; the page will load without them");
       pendingDocumentStartScripts.clear();
-      finishDocumentStartScriptRetries(anySuccess);
+      finishDocumentStartScriptRetries(recoveredAnyThisEpisode);
       return;
     }
     retryDelayMs = Math.min(retryDelayMs * 2, RETRY_MAX_DELAY_MS);
@@ -655,6 +661,7 @@ public class UserContentController implements Disposable {
   private void finishDocumentStartScriptRetries(boolean recovered) {
     retryDelayMs = RETRY_INITIAL_DELAY_MS;
     firstFailureUptimeMs = 0;
+    recoveredAnyThisEpisode = false;
     List<Runnable> callbacks = new ArrayList<>(documentStartScriptsReadyCallbacks);
     documentStartScriptsReadyCallbacks.clear();
     for (Runnable callback : callbacks) {
