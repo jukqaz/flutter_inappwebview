@@ -4,16 +4,15 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/*.test.cjs"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "basic-auth": "latest",
-    "body-parser": "^1.20.0",
-    "cors": "^2.8.5",
-    "express": "latest",
-    "https": "latest",
-    "multiparty": "^4.2.3"
+    "basic-auth": "2.0.1",
+    "body-parser": "2.3.0",
+    "cors": "2.8.6",
+    "express": "5.3.0",
+    "multiparty": "4.3.1"
   }
 }
