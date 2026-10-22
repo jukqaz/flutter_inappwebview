@@ -23,6 +23,7 @@ const fs = require('fs')
 const path = require('path')
 const bodyParser = require('body-parser');
 const multiparty = require('multiparty');
+const testHost = process.env.INAPPWEBVIEW_TEST_HOST || '127.0.0.1';
 
 var options = {
   key: fs.readFileSync('server-key.pem'),
@@ -83,7 +84,7 @@ appHttps.get('/', (req, res) => {
 })
 
 // Let's create our HTTPS server and we're ready to go.
-https.createServer(options, appHttps).listen(4433)
+const httpsServer = https.createServer(options, appHttps).listen(4433, testHost)
 
 
 
@@ -129,7 +130,7 @@ appAuthBasic.get('/test-index', (req, res) => {
     res.sendFile(__dirname + '/public/test-index.html');
 });
 
-appAuthBasic.listen(8081);
+const authServer = appAuthBasic.listen(8081, testHost);
 
 
 app.use(cors());
@@ -222,7 +223,7 @@ app.get("/test-download-file", (req, res) => {
   res.end();
 })
 
-app.listen(8082)
+const appServer = app.listen(8082, testHost)
 
 // Proxy server
 // Create an HTTP tunneling proxy
@@ -256,10 +257,12 @@ proxy.on('connect', (req, clientSocket, head) => {
     clientSocket.pipe(serverSocket);
   });
 });
-proxy.listen(8083, null, () => {
+proxy.listen(8083, testHost, () => {
   console.log('proxy server listening on port 8083');
 });
 
 process.on('uncaughtException', function (err) {
   console.error(err);
 });
+
+module.exports = [httpsServer, authServer, appServer, proxy];
